@@ -8,6 +8,7 @@ from pytorch_toolbelt.utils.torch_utils import tensor_from_rgb_image, tensor_fro
 from pytorch_toolbelt import losses as L
 from sklearn.model_selection import train_test_split
 from torch import nn
+import torch
 from torch.nn import BCEWithLogitsLoss
 from torch.nn import functional as F
 from torch.utils.data import Dataset, WeightedRandomSampler, SubsetRandomSampler, DataLoader
@@ -42,7 +43,7 @@ def make_mask(row_id, df):
 
 
 class SteelDatasetMulti(Dataset):
-    def __init__(self, df, data_folder, transforms, phase, prepare_coarse = False, prepare_edges = False):
+    def __init__(self, df, data_folder, transforms, phase, prepare_coarse = False, prepare_edges = False, prepare_class = False):
         self.df = df
         self.root = data_folder
         self.phase = phase
@@ -50,6 +51,7 @@ class SteelDatasetMulti(Dataset):
         self.fnames = self.df.index.tolist()
         self.prepare_coarse = prepare_coarse
         self.prepare_edges = prepare_edges
+        self.prepare_class = prepare_class
         
     def __getitem__(self, idx):
         image_id, mask = make_mask(idx, self.df)
@@ -60,28 +62,36 @@ class SteelDatasetMulti(Dataset):
             img = augmented['image']
             mask = augmented['mask'].astype(np.uint8)
         all_masks_combined = (mask.sum(axis=2)>0).astype(np.uint8)
+        all_masks_combined = np.expand_dims(all_masks_combined, 2)
+        #merge all masks with per-defect masks
+        mask = np.concatenate([mask, all_masks_combined], axis=2)
         if self.prepare_edges:
             edges = compute_boundary_mask(all_masks_combined)
         if self.prepare_coarse:
             coarse_mask = cv2.resize(mask,
                                      dsize=(mask.shape[1]//4, mask.shape[0]//4),
                                      interpolation=cv2.INTER_LINEAR)
-            
-            coarse_all_masks_combined = cv2.resize(all_masks_combined,
-                                                   dsize=(mask.shape[1]//4, mask.shape[0]//4),
-                                                   interpolation=cv2.INTER_LINEAR)
-            
+        if self.prepare_class:
+            has_defect = 0
+            if mask.sum()>0:
+                has_defect = 1
+        
         data = {'features': tensor_from_rgb_image(img),
                 'targets': tensor_from_mask_image(mask).float(),
-                'targets_combined' : tensor_from_mask_image(all_masks_combined).float(),
                 'image_id':image_id}
         
         if self.prepare_coarse:
             data['coarse_targets'] =  tensor_from_mask_image(coarse_mask).float()
-            data['coarse_targets_combined'] = tensor_from_mask_image(coarse_all_masks_combined).float()
 
         if self.prepare_edges:
-            data['edges'] = edges               
+            data['edges'] = edges 
+            
+        if self.prepare_class:
+            data['classification'] = torch.from_numpy(np.expand_dims(has_defect, 0)).float()
+            
+            
+        
+        
         return data
   
     def __len__(self):
@@ -96,7 +106,8 @@ def provider(
     batch_size=8,
     num_workers=4,
     prepare_coarse = False, 
-    prepare_edges = False
+    prepare_edges = False,
+    prepare_class = False
 ):
     '''Returns dataloader for the model training'''
     df = pd.read_csv(df_path)
@@ -109,7 +120,7 @@ def provider(
     
     train_df, val_df = train_test_split(df, test_size=0.2, stratify=df["defects"], random_state=69)
     df = train_df if phase == "train" else val_df
-    image_dataset = SteelDatasetMulti(df, data_folder, transforms, phase, prepare_coarse, prepare_edges)
+    image_dataset = SteelDatasetMulti(df, data_folder, transforms, phase, prepare_coarse, prepare_edges, prepare_class)
     if phase=='train':
         shuffle = True
     else:

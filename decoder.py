@@ -49,7 +49,9 @@ class UnetDecoder(Model):
             use_batchnorm=True,
             center=False,
             attention_type=None,
-            conv_coarse_channels=(32, 16)
+            conv_coarse_channels=(64, 32, 16, 8),
+            pooling_type = 'average',
+            num_classes_classification = 1
     ):
         super().__init__()
 
@@ -74,29 +76,45 @@ class UnetDecoder(Model):
                                    use_batchnorm=use_batchnorm, attention_type=attention_type)
 
         self.final_conv = nn.Conv2d(out_channels[4], final_channels, kernel_size=(1, 1))
-        self.final_conv_combined = nn.Conv2d(out_channels[4], 1, kernel_size=(1, 1))
+        
+        self.conv_coarse_channels = conv_coarse_channels
+        
         self.final_conv_coarse = nn.Sequential(
             Conv2dReLU(out_channels[2], 
-                       conv_coarse_channels[0],
+                       self.conv_coarse_channels[0],
                        kernel_size=3, padding=1, use_batchnorm=use_batchnorm),
-            Conv2dReLU(conv_coarse_channels[0], 
-                       conv_coarse_channels[1], 
+            Conv2dReLU(self.conv_coarse_channels[0], 
+                       self.conv_coarse_channels[1], 
                        kernel_size=3, padding=1, use_batchnorm=use_batchnorm),
-            nn.Conv2d(conv_coarse_channels[1], 
+            Conv2dReLU(self.conv_coarse_channels[1], 
+                       self.conv_coarse_channels[2], 
+                       kernel_size=3, padding=1, use_batchnorm=use_batchnorm),
+            Conv2dReLU(self.conv_coarse_channels[2], 
+                       self.conv_coarse_channels[3], 
+                       kernel_size=3, padding=1, use_batchnorm=use_batchnorm),
+            nn.Conv2d(self.conv_coarse_channels[3], 
                        final_channels, 
                        kernel_size=(1, 1))
         )
-        self.final_conv_coarse_combined = nn.Sequential(
-            Conv2dReLU(out_channels[2], 
-                       conv_coarse_channels[0],
-                       kernel_size=3, padding=1, use_batchnorm=use_batchnorm),
-            Conv2dReLU(conv_coarse_channels[0], 
-                       conv_coarse_channels[1], 
-                       kernel_size=3, padding=1, use_batchnorm=use_batchnorm),
-            nn.Conv2d(conv_coarse_channels[1], 
-                       1, 
-                       kernel_size=(1, 1))
-        )
+
+        if pooling_type == 'average':
+            self.pooling_encoder_features = nn.AdaptiveAvgPool2d(1)
+        elif pooling_type == 'max':
+            self.pooling_encoder_features = nn.AdaptiveMaxPool2d(1) 
+ 
+        #define classification head as Dense x Dropout x BN
+        
+        self.num_classes_classification = num_classes_classification
+        
+        self.classification_head = nn.Sequential(
+            nn.Dropout(p=0.25),
+            nn.Linear(sum(encoder_channels[1:]), 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(p=0.25),
+            nn.Linear(128, self.num_classes_classification),
+            )
+        
         self.initialize()
 
     def compute_channels(self, encoder_channels, decoder_channels):
@@ -121,13 +139,19 @@ class UnetDecoder(Model):
         x_3 = self.layer3([x_2, skips[2]])
         x_4 = self.layer4([x_3, skips[3]])
         x_5 = self.layer5([x_4, None])
+        
+        #making features for the classification head
+        encoder_features = [self.pooling_encoder_features(x) for x in skips]
+        encoder_features = [x.view(x.size(0), -1) for x in encoder_features]
+        
+        classification_features = torch.cat(encoder_features, 1)
+        classication_output = self.classification_head(classification_features) 
+        #to do: reshape and add as layers to the segmentation head    
+
         x_final = self.final_conv(x_5)
-        x_final_combined = self.final_conv_combined(x_5)
         x_coarse = self.final_conv_coarse(x_3)
-        x_coarse_combined = self.final_conv_coarse_combined(x_3)
-        #x_classification =  #a
+
         output = {'logits':x_final, 
-                  'logits_coarse':x_coarse, 
-                  'logits_combined':x_final_combined,
-                  'logits_coarse_combined':x_coarse_combined}
+                  'logits_coarse':x_coarse,
+                  'class_logits':classication_output}
         return output
