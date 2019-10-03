@@ -110,7 +110,7 @@ class SteelDataset(Dataset):
         self.fnames = self.df.index.tolist()
         
     def __getitem__(self, idx):
-        image_id, mask = make_mask_allTogether(idx, self.df)
+        image_id, mask = make_mask(idx, self.df)
         #print(mask.max())
         image_path = os.path.join(self.root,  image_id)
         img = cv2.imread(image_path)
@@ -119,8 +119,12 @@ class SteelDataset(Dataset):
         mask = augmented['mask']
         
         img = torch.from_numpy(img.transpose((2, 0, 1))).float()
-        #mask = torch.from_numpy(mask.transpose((2, 0, 1))).long()
-        mask = torch.from_numpy(mask).long()
+        mask = torch.from_numpy(mask.transpose((2, 0, 1))).float()
+        # torch.from_numpy(mask).long()
+        # if mask.max() > 0:
+        #     mask = torch.tensor(np.asarray([1])).float()
+        # else:
+        #     mask = torch.tensor(np.asarray([0])).float()
         return img, mask
 
     def __len__(self):
