@@ -12,15 +12,30 @@ import torch
 from torch.nn import BCEWithLogitsLoss
 from torch.nn import functional as F
 from torch.utils.data import Dataset, WeightedRandomSampler, SubsetRandomSampler, DataLoader
+from functools import partial
+
+import numpy as np
+import torch
+from catalyst.dl import Callback, RunnerState, MetricCallback, CallbackOrder
+from pytorch_toolbelt.utils.catalyst.visualization import get_tensorboard_logger
+from pytorch_toolbelt.utils.torch_utils import to_numpy
+from pytorch_toolbelt.utils.visualization import (
+    render_figure_to_tensor,
+    plot_confusion_matrix,
+)
+from sklearn.metrics import f1_score, confusion_matrix
+
 
 def compute_boundary_mask(mask: np.ndarray) -> np.ndarray:
-    dilated = binary_dilation(mask, structure=np.ones((5, 5), dtype=np.bool))
+    dilated = binary_dilation(mask, structure=np.ones((9, 9), dtype=np.bool))
     dilated = binary_fill_holes(dilated)
-
     diff = dilated & ~mask
-    diff = cv2.dilate(diff, kernel=(5, 5))
+    diff = cv2.dilate(diff, kernel=(9, 9))
     diff = diff & ~mask
+    #kernel = np.ones((4,),np.uint8)
+    #diff = cv2.morphologyEx(mask, cv2.MORPH_GRADIENT, kernel)
     return diff.astype(np.uint8)
+
 
 
 def make_mask(row_id, df):
@@ -43,7 +58,7 @@ def make_mask(row_id, df):
 
 
 class SteelDatasetMulti(Dataset):
-    def __init__(self, df, data_folder, transforms, phase, prepare_coarse = False, prepare_edges = False, prepare_class = False):
+    def __init__(self, df, data_folder, transforms, phase, prepare_coarse = False, prepare_edges = False, prepare_class = False, prepare_full = False):
         self.df = df
         self.root = data_folder
         self.phase = phase
@@ -52,6 +67,7 @@ class SteelDatasetMulti(Dataset):
         self.prepare_coarse = prepare_coarse
         self.prepare_edges = prepare_edges
         self.prepare_class = prepare_class
+        self.prepare_full = prepare_full
         
     def __getitem__(self, idx):
         image_id, mask = make_mask(idx, self.df)
@@ -61,33 +77,45 @@ class SteelDatasetMulti(Dataset):
             augmented = self.transforms(image=img, mask=mask)
             img = augmented['image']
             mask = augmented['mask'].astype(np.uint8)
-        all_masks_combined = (mask.sum(axis=2)>0).astype(np.uint8)
-        all_masks_combined = np.expand_dims(all_masks_combined, 2)
-        #merge all masks with per-defect masks
-        mask = np.concatenate([mask, all_masks_combined], axis=2)
+        if self.prepare_full:
+            all_masks_combined = (mask.sum(axis=2)>0).astype(np.uint8)        
+            all_masks_combined = np.expand_dims(all_masks_combined, 2)
+            mask = np.concatenate([mask, all_masks_combined], axis=2)
         if self.prepare_edges:
-            edges = compute_boundary_mask(all_masks_combined)
+            all_masks_combined = (mask.sum(axis=2)>0).astype(np.uint8)  
+            edges = compute_boundary_mask(all_masks_combined).astype(np.uint8)
+            edges = np.expand_dims(edges, 2)
+            mask = np.concatenate([mask, edges], axis=2)
         if self.prepare_coarse:
             coarse_mask = cv2.resize(mask,
                                      dsize=(mask.shape[1]//4, mask.shape[0]//4),
                                      interpolation=cv2.INTER_LINEAR)
+            if self.prepare_edges:
+                coarse_edges = cv2.resize(edges,
+                                     dsize=(mask.shape[1]//4, mask.shape[0]//4),
+                                     interpolation=cv2.INTER_LINEAR)
+                coarse_edges = np.expand_dims(coarse_edges, 2)
         if self.prepare_class:
-            has_defect = 0
             if mask.sum()>0:
                 has_defect = 1
-        
+            else:
+                has_defect = 0
+            
         data = {'features': tensor_from_rgb_image(img),
                 'targets': tensor_from_mask_image(mask).float(),
                 'image_id':image_id}
         
-        if self.prepare_coarse:
-            data['coarse_targets'] =  tensor_from_mask_image(coarse_mask).float()
+        #if self.prepare_coarse:
+        #    data['coarse_targets'] =  tensor_from_mask_image(coarse_mask).float()
 
-        if self.prepare_edges:
-            data['edges'] = edges 
+        #if self.prepare_edges:
+        #    data['edges'] = tensor_from_mask_image(edges).float()
             
-        if self.prepare_class:
-            data['classification'] = torch.from_numpy(np.expand_dims(has_defect, 0)).float()
+        #if self.prepare_edges and self.prepare_edges:
+        #    data['coarse_edges'] = tensor_from_mask_image(coarse_edges).float()
+            
+        #if self.prepare_class:
+        #    data['class'] = torch.from_numpy(np.expand_dims(has_defect, 0)).float()
             
             
         
@@ -107,7 +135,8 @@ def provider(
     num_workers=4,
     prepare_coarse = False, 
     prepare_edges = False,
-    prepare_class = False
+    prepare_class = False, 
+    prepare_full = False
 ):
     '''Returns dataloader for the model training'''
     df = pd.read_csv(df_path)
@@ -120,7 +149,7 @@ def provider(
     
     train_df, val_df = train_test_split(df, test_size=0.2, stratify=df["defects"], random_state=69)
     df = train_df if phase == "train" else val_df
-    image_dataset = SteelDatasetMulti(df, data_folder, transforms, phase, prepare_coarse, prepare_edges, prepare_class)
+    image_dataset = SteelDatasetMulti(df, data_folder, transforms, phase, prepare_coarse, prepare_edges, prepare_class, prepare_full)
     if phase=='train':
         shuffle = True
     else:
@@ -151,8 +180,10 @@ def light_augmentations(crop_size, safe_crop_around_mask = True):
 
         # D4 Augmentations
         A.Compose([
-            A.Transpose(),
-            A.RandomRotate90(),
+            #A.Transpose(),            
+            A.HorizontalFlip(),            
+            A.VerticalFlip()
+            #A.RandomRotate90(),
         ]),
 
         # Spatial-preserving augmentations:
@@ -194,8 +225,10 @@ def medium_augmentations(crop_size, safe_crop_around_mask = True):
 
         # D4 Augmentations
         A.Compose([
-            A.Transpose(),
-            A.RandomRotate90(),
+            #A.Transpose(),
+            A.VerticalFlip(),
+            A.HorizontalFlip()
+            #A.RandomRotate90(),
         ]),
 
         # Spatial-preserving augmentations:
@@ -219,6 +252,7 @@ def hard_augmentations(crop_size, safe_crop_around_mask = True):
     if safe_crop_around_mask:
         spatial_transform = A.Compose([
             A.CropNonEmptyMaskIfExists(height = crop_size, width = crop_size),
+            #A.PadIfNeeded(min_width=1792, min_height=256)
         ])
     else:
         spatial_transform = A.Compose([
@@ -238,8 +272,10 @@ def hard_augmentations(crop_size, safe_crop_around_mask = True):
 
         # D4 Augmentations
         A.Compose([
-            A.Transpose(),
-            A.RandomRotate90(),
+            #A.Transpose(),
+            A.VerticalFlip(),
+            A.HorizontalFlip()
+            #A.RandomRotate90(),
         ]),
 
         A.Cutout(),
@@ -278,8 +314,14 @@ def get_loss(loss_name: str, **kwargs):
     if loss_name.lower() == 'bce_jaccard':
         return L.JointLoss(first=BCEWithLogitsLoss(), second=L.BinaryJaccardLoss(), first_weight=1.0, second_weight=0.5)
 
+    if loss_name.lower() == 'bce_dice':
+        return L.JointLoss(first=BCEWithLogitsLoss(), second=L.DiceLoss(mode='binary'), first_weight=1.0, second_weight=1.0)    
+
+    if loss_name.lower() == 'bce_log_dice':
+        return L.JointLoss(first=BCEWithLogitsLoss(), second=L.DiceLoss(mode='binary',log_loss=True), first_weight=1.0, second_weight=1.0)   
+    
     if loss_name.lower() == 'bce_log_jaccard':
-        return L.JointLoss(first=BCEWithLogitsLoss(), second=L.BinaryJaccardLogLoss(), first_weight=1.0, second_weight=0.5)
+        return L.JointLoss(first=BCEWithLogitsLoss(), second=L.JaccardLoss(mode='binary',log_loss=True), first_weight=1.0, second_weight=0.5)
 
     if loss_name.lower() == 'bce_lovasz':
         return L.JointLoss(first=BCEWithLogitsLoss(), second=L.BinaryLovaszLoss(), first_weight=1.0, second_weight=0.25)
@@ -358,3 +400,154 @@ def dice(im1, im2, empty_score=1.0):
     intersection = np.logical_and(im1, im2)
 
     return 2. * intersection.sum() / im_sum
+
+
+
+
+
+
+
+BINARY_MODE = "binary"
+def binary_dice_iou_score(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    mode="dice",
+    threshold=None,
+    nan_score_on_empty=False,
+    eps=1e-7,
+) -> float:
+    """
+    Compute IoU score between two image tensors
+    :param y_pred: Input image tensor of any shape
+    :param y_true: Target image of any shape (must match size of y_pred)
+    :param mode: Metric to compute (dice, iou)
+    :param threshold: Optional binarization threshold to apply on @y_pred
+    :param nan_score_on_empty: If true, return np.nan if target has no positive pixels;
+        If false, return 1. if both target and input are empty, and 0 otherwise.
+    :param eps: Small value to add to denominator for numerical stability
+    :return: Float scalar
+    """
+    assert mode in {"dice", "iou"}
+
+    # Binarize predictions
+    if threshold is not None:
+        y_pred = (y_pred > threshold).to(y_true.dtype)
+
+    intersection = torch.sum(y_pred * y_true).item()
+    cardinality = (torch.sum(y_pred) + torch.sum(y_true)).item()
+
+    if mode == "dice":
+        score = (2.0 * intersection) / (cardinality + eps)
+    else:
+        score = intersection / (cardinality + eps)
+
+    has_targets = torch.sum(y_true) > 0
+    has_predicted = torch.sum(y_pred) > 0
+
+    if not has_targets:
+        if nan_score_on_empty:
+            score = np.nan
+        else:
+            score = float(not has_predicted)
+    return score
+
+def multilabel_dice_iou_score(
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    mode="dice",
+    threshold=None,
+    eps=1e-7,
+    nan_score_on_empty=False,
+    classes_of_interest=None,
+):
+    ious = []
+    num_classes = y_pred.size(0)
+
+    if classes_of_interest is None:
+        classes_of_interest = range(num_classes)
+
+    for class_index in classes_of_interest:
+        iou = binary_dice_iou_score(
+            y_pred=y_pred[class_index],
+            y_true=y_true[class_index],
+            mode=mode,
+            threshold=threshold,
+            nan_score_on_empty=nan_score_on_empty,
+            eps=eps,
+        )
+        ious.append(iou)
+
+    return ious
+
+
+class DiceScoreCallback(Callback):
+    """
+    A metric callback for computing either Dice or Jaccard metric
+    which is computed across whole epoch, not per-batch.
+    """
+
+    def __init__(
+        self,
+        mode: str,
+        metric="dice",
+        input_key: str = "targets",
+        output_key: str = "logits",
+        nan_score_on_empty=True,
+        prefix: str = None,
+    ):
+        """
+        :param mode: One of: 'binary', 'multiclass', 'multilabel'.
+        :param input_key: input key to use for precision calculation; specifies our `y_true`.
+        :param output_key: output key to use for precision calculation; specifies our `y_pred`.
+        :param accuracy_for_empty:
+        """
+        super().__init__(CallbackOrder.Metric)
+        assert mode in {BINARY_MODE}
+
+        if prefix is None:
+            prefix = metric
+
+
+        self.mode = mode
+        self.prefix = prefix
+        self.output_key = output_key
+        self.input_key = input_key
+        self.scores = []
+
+        if self.mode == BINARY_MODE:
+            self.score_fn = partial(
+                binary_dice_iou_score,
+                threshold=0.0,
+                nan_score_on_empty=nan_score_on_empty,
+                mode=metric,
+            )
+
+    def on_loader_start(self, state):
+        self.scores = []
+
+    @torch.no_grad()
+    def on_batch_end(self, state: RunnerState):
+        outputs = state.output[self.output_key].detach()
+        targets = state.input[self.input_key].detach()
+
+        batch_size = targets.size(0)
+        #n_classes = targets.size(1)
+        n_classes = 4
+        score_per_image_class_pair = []
+        for image_index in range(batch_size):
+            for class_id in range(n_classes):
+                score = self.score_fn(
+                    y_pred=outputs[image_index,class_id,:,:],
+                    y_true=targets[image_index,class_id,:,:]
+                )
+                score_per_image_class_pair.append(score)
+
+        mean_score = np.nanmean(score_per_image_class_pair)
+        state.metrics.add_batch_value(self.prefix, float(mean_score))
+        self.scores.extend(score_per_image_class_pair)
+
+    def on_loader_end(self, state):
+        scores = np.array(self.scores)
+        mean_score = np.nanmean(scores)
+
+        state.metrics.epoch_values[state.loader_name][self.prefix] = float(mean_score)

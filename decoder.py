@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from blocks import Conv2dReLU, SCSEModule
-from base_model import Model
+from ..common.blocks import Conv2dReLU, SCSEModule
+from ..base.model import Model
 
 
 class DecoderBlock(nn.Module):
@@ -45,13 +45,13 @@ class UnetDecoder(Model):
             self,
             encoder_channels,
             decoder_channels=(256, 128, 64, 32, 16),
+            conv_coarse_channels=(64, 32, 16, 8),
             final_channels=1,
             use_batchnorm=True,
             center=False,
-            attention_type=None,
-            conv_coarse_channels=(64, 32, 16, 8),
-            pooling_type = 'average',
-            num_classes_classification = 1
+            pooling_type='average',
+            num_classes_classification = 1,
+            attention_type=None
     ):
         super().__init__()
 
@@ -61,6 +61,24 @@ class UnetDecoder(Model):
         else:
             self.center = None
 
+            
+        '''
+        Adding custom head for classification, define pooling type and 
+        number of classes for prediction
+        '''
+        if pooling_type == 'average':
+            self.pooling_encoder_features = nn.AdaptiveAvgPool2d(1)
+        elif pooling_type == 'max':
+            self.pooling_encoder_features = nn.AdaptiveMaxPool2d(1) 
+            
+        self.num_classes_classification = num_classes_classification
+        
+        self.classification_head = nn.Sequential(
+            nn.Dropout(p=0.5),
+            nn.Linear(sum(encoder_channels[1:]), self.num_classes_classification),
+            )      
+        
+        
         in_channels = self.compute_channels(encoder_channels, decoder_channels)
         out_channels = decoder_channels
 
@@ -74,11 +92,12 @@ class UnetDecoder(Model):
                                    use_batchnorm=use_batchnorm, attention_type=attention_type)
         self.layer5 = DecoderBlock(in_channels[4], out_channels[4],
                                    use_batchnorm=use_batchnorm, attention_type=attention_type)
-
         self.final_conv = nn.Conv2d(out_channels[4], final_channels, kernel_size=(1, 1))
-        
+
+        '''
+        Adding another head for segmentation of a coarse mask
+        '''
         self.conv_coarse_channels = conv_coarse_channels
-        
         self.final_conv_coarse = nn.Sequential(
             Conv2dReLU(out_channels[2], 
                        self.conv_coarse_channels[0],
@@ -95,25 +114,7 @@ class UnetDecoder(Model):
             nn.Conv2d(self.conv_coarse_channels[3], 
                        final_channels, 
                        kernel_size=(1, 1))
-        )
-
-        if pooling_type == 'average':
-            self.pooling_encoder_features = nn.AdaptiveAvgPool2d(1)
-        elif pooling_type == 'max':
-            self.pooling_encoder_features = nn.AdaptiveMaxPool2d(1) 
- 
-        #define classification head as Dense x Dropout x BN
-        
-        self.num_classes_classification = num_classes_classification
-        
-        self.classification_head = nn.Sequential(
-            nn.Dropout(p=0.25),
-            nn.Linear(sum(encoder_channels[1:]), 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(p=0.25),
-            nn.Linear(128, self.num_classes_classification),
-            )
+        )        
         
         self.initialize()
 
@@ -130,28 +131,28 @@ class UnetDecoder(Model):
     def forward(self, x):
         encoder_head = x[0]
         skips = x[1:]
-
+        
+        '''
+        Make features for the classification head by pooling each skip and 
+        concatenating themm all together and passig thu the classification head 
+        '''
+        encoder_features = [self.pooling_encoder_features(x) for x in skips]
+        encoder_features = [x.view(x.size(0), -1) for x in encoder_features]
+        encoder_features = torch.cat(encoder_features, 1)
+        classication_output = self.classification_head(encoder_features) 
+        
         if self.center:
             encoder_head = self.center(encoder_head)
 
-        x_1 = self.layer1([encoder_head, skips[0]])
-        x_2 = self.layer2([x_1, skips[1]])
-        x_3 = self.layer3([x_2, skips[2]])
-        x_4 = self.layer4([x_3, skips[3]])
-        x_5 = self.layer5([x_4, None])
+        x = self.layer1([encoder_head, skips[0]])
+        x = self.layer2([x, skips[1]])
+        x = self.layer3([x, skips[2]])
+        x_coarse = self.final_conv_coarse(x)
+        x = self.layer4([x, skips[3]])
+        x = self.layer5([x, None])
+        x = self.final_conv(x)
         
-        #making features for the classification head
-        encoder_features = [self.pooling_encoder_features(x) for x in skips]
-        encoder_features = [x.view(x.size(0), -1) for x in encoder_features]
-        
-        classification_features = torch.cat(encoder_features, 1)
-        classication_output = self.classification_head(classification_features) 
-        #to do: reshape and add as layers to the segmentation head    
-
-        x_final = self.final_conv(x_5)
-        x_coarse = self.final_conv_coarse(x_3)
-
-        output = {'logits':x_final, 
-                  'logits_coarse':x_coarse,
-                  'class_logits':classication_output}
+        output = {'logits' : x, 
+                  'coarse_logits' : x_coarse,
+                  'classification_logits' : classication_output}
         return output
