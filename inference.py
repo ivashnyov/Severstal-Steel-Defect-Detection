@@ -70,8 +70,6 @@ def post_process(probability, threshold, min_size):
     return predictions, num
 
 if __name__ == "__main__":
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2"
     sample_submission_path = 'data/sample_submission.csv'
     train_df_path = 'data/train.csv'
     data_folder = "data/train_images/"

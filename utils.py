@@ -10,6 +10,7 @@ from tqdm import tqdm
 from pytorch_toolbelt.inference.tiles import ImageSlicer, CudaTileMerger
 from pytorch_toolbelt.utils.torch_utils import tensor_from_rgb_image, to_numpy
 import matplotlib.pyplot as plot
+
 def make_mask(row_id, df):
     '''Given a row index, return image_id and mask (256, 1600, 4) from the dataframe `df`'''
     fname = df.iloc[row_id].name
