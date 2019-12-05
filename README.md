@@ -1,5 +1,5 @@
 # Severstal-Steel-Defect-Detection
-Bronze solution (136 place, but 35 on public :() for kaggle competition Severstal: Steel Defect Detection
+Bronze solution (136 place, but 35 on public :hushed:) for kaggle competition Severstal: Steel Defect Detection
 ## FYI
 The code given here is an example of training and testing piplines. The final solution is a blend of many moldes trained this (or very similar) way.
 ## Thanksgiving
